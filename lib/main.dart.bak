@@ -1,0 +1,1137 @@
+// ClassCheck QR (ดีไซน์ใหม่) - วางทับไฟล์ lib/main.dart
+// ต้องมีแพ็กเกจ: flutter pub add google_fonts
+import 'dart:math';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'firebase_options.dart'; // สร้างโดย flutterfire configure
+
+final db = FirebaseFirestore.instance;
+final auth = FirebaseAuth.instance;
+
+// Web client ID: Firebase Console > Authentication > Sign-in method > Google > Web SDK configuration
+const kWebClientId = '816524800203-j6no7arilqku3pvi7mq09i152e79kf5m.apps.googleusercontent.com';
+const kRadiusMeters = 1000.0; // รัศมีเช็คชื่อ (สไลด์ระบุ 1 กม.)
+const kLateMinutes = 15; // เกินกี่นาทีนับว่า "สาย"
+
+// ---------- palette ----------
+const kBlue = Color(0xFF4F7FE8); // น้ำเงินจากสไลด์
+const kBlueDeep = Color(0xFF2E55C9);
+const kInk = Color(0xFF16213A);
+const kMuted = Color(0xFF6B7690);
+const kPaper = Color(0xFFF5F8FF);
+const kLine = Color(0xFFE1E8F7);
+const kOk = Color(0xFF1FA971);
+const kLate = Color(0xFFF29B2C);
+const kAbsent = Color(0xFFE5484D);
+const kTiles = [kBlue, Color(0xFF2FB38A), Color(0xFFF2994A), Color(0xFF8B6BE0), Color(0xFFE2607D)];
+
+bool gsiReady = false;
+bool registering = false;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  runApp(const App());
+}
+
+// ---------- helpers ----------
+void toast(BuildContext c, String m) => ScaffoldMessenger.of(c).showSnackBar(SnackBar(
+      content: Text(m),
+      behavior: SnackBarBehavior.floating,
+      backgroundColor: kInk,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    ));
+
+String p2(int n) => n.toString().padLeft(2, '0');
+String fmt(DateTime? d) =>
+    d == null ? '-' : '${p2(d.day)}/${p2(d.month)}/${d.year + 543} ${p2(d.hour)}:${p2(d.minute)}';
+String fmtTime(DateTime? d) => d == null ? '-' : '${p2(d.hour)}:${p2(d.minute)} น.';
+
+String genCode() {
+  const ch = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  final r = Random();
+  return List.generate(6, (_) => ch[r.nextInt(ch.length)]).join();
+}
+
+Future<Position> getPos() async {
+  if (!await Geolocator.isLocationServiceEnabled()) throw 'กรุณาเปิด GPS';
+  var p = await Geolocator.checkPermission();
+  if (p == LocationPermission.denied) p = await Geolocator.requestPermission();
+  if (p == LocationPermission.denied || p == LocationPermission.deniedForever) {
+    throw 'ไม่ได้รับสิทธิ์เข้าถึงตำแหน่ง';
+  }
+  return Geolocator.getCurrentPosition();
+}
+
+Future<List<String>?> askText(BuildContext c, String title, List<String> labels) {
+  final ctrls = labels.map((_) => TextEditingController()).toList();
+  return showDialog<List<String>>(
+    context: c,
+    builder: (_) => AlertDialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        for (var i = 0; i < labels.length; i++)
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: TextField(controller: ctrls[i], decoration: InputDecoration(labelText: labels[i])),
+          ),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c), child: const Text('ยกเลิก')),
+        FilledButton(
+          style: FilledButton.styleFrom(minimumSize: const Size(96, 44)),
+          onPressed: () => Navigator.pop(c, ctrls.map((e) => e.text.trim()).toList()),
+          child: const Text('ตกลง'),
+        ),
+      ],
+    ),
+  );
+}
+
+Color statusColor(String s) =>
+    s == 'ตรงเวลา' ? kOk : (s == 'สาย' ? kLate : (s == 'ขาด' ? kAbsent : kMuted));
+
+// ---------- reusable widgets ----------
+class Header extends StatelessWidget {
+  final Widget child;
+  const Header({super.key, required this.child});
+  @override
+  Widget build(BuildContext context) => Container(
+        width: double.infinity,
+        padding: EdgeInsets.fromLTRB(24, MediaQuery.of(context).padding.top + 20, 24, 28),
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+              begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [kBlue, kBlueDeep]),
+          borderRadius: BorderRadius.vertical(bottom: Radius.circular(32)),
+        ),
+        child: child,
+      );
+}
+
+class StatusChip extends StatelessWidget {
+  final String s;
+  const StatusChip(this.s, {super.key});
+  @override
+  Widget build(BuildContext context) {
+    final c = statusColor(s);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      decoration: BoxDecoration(color: c.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(20)),
+      child: Text(s, style: TextStyle(color: c, fontWeight: FontWeight.w600, fontSize: 13)),
+    );
+  }
+}
+
+class EmptyState extends StatelessWidget {
+  final IconData icon;
+  final String title, hint;
+  const EmptyState({super.key, required this.icon, required this.title, required this.hint});
+  @override
+  Widget build(BuildContext context) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 84,
+              height: 84,
+              decoration: BoxDecoration(color: kBlue.withValues(alpha: 0.1), shape: BoxShape.circle),
+              child: Icon(icon, size: 40, color: kBlue),
+            ),
+            const SizedBox(height: 16),
+            Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 6),
+            Text(hint, textAlign: TextAlign.center, style: const TextStyle(color: kMuted)),
+          ]),
+        ),
+      );
+}
+
+// แถบสัดส่วน ตรงเวลา/สาย/ขาด (เหมือนในภาพ UI ของสไลด์)
+class StatusBar extends StatelessWidget {
+  final int ok, late, absent;
+  const StatusBar({super.key, required this.ok, required this.late, required this.absent});
+  @override
+  Widget build(BuildContext context) {
+    final total = ok + late + absent;
+    Widget seg(int n, Color c) => n == 0 ? const SizedBox() : Expanded(flex: n, child: Container(color: c));
+    Widget stat(String label, int n, Color c) => Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('$n', style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700, color: c, height: 1.1)),
+            Row(children: [
+              Container(width: 8, height: 8, decoration: BoxDecoration(color: c, shape: BoxShape.circle)),
+              const SizedBox(width: 6),
+              Text(label, style: const TextStyle(color: kMuted, fontSize: 13)),
+            ]),
+          ]),
+        );
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+          color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: kLine)),
+      child: Column(children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: SizedBox(
+            height: 10,
+            child: total == 0
+                ? Container(color: kLine)
+                : Row(children: [seg(ok, kOk), seg(late, kLate), seg(absent, kAbsent)]),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Row(children: [stat('ตรงเวลา', ok, kOk), stat('สาย', late, kLate), stat('ขาด', absent, kAbsent)]),
+      ]),
+    );
+  }
+}
+
+// ---------- app ----------
+class App extends StatelessWidget {
+  const App({super.key});
+  @override
+  Widget build(BuildContext context) {
+    final field = OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14), borderSide: const BorderSide(color: kLine));
+    return MaterialApp(
+      title: 'ClassCheck QR',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(seedColor: kBlue, surface: Colors.white),
+        scaffoldBackgroundColor: kPaper,
+        textTheme: GoogleFonts.promptTextTheme().apply(bodyColor: kInk, displayColor: kInk),
+        appBarTheme: AppBarTheme(
+          backgroundColor: kPaper,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          foregroundColor: kInk,
+          titleTextStyle: GoogleFonts.prompt(fontSize: 19, fontWeight: FontWeight.w600, color: kInk),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.white,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+          border: field,
+          enabledBorder: field,
+          focusedBorder: field.copyWith(borderSide: const BorderSide(color: kBlue, width: 2)),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            backgroundColor: kBlue,
+            minimumSize: const Size.fromHeight(54),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            textStyle: GoogleFonts.prompt(fontSize: 16, fontWeight: FontWeight.w600),
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            foregroundColor: kInk,
+            minimumSize: const Size.fromHeight(54),
+            side: const BorderSide(color: kLine, width: 1.5),
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            textStyle: GoogleFonts.prompt(fontSize: 15, fontWeight: FontWeight.w500),
+          ),
+        ),
+        floatingActionButtonTheme: FloatingActionButtonThemeData(
+          backgroundColor: kBlue,
+          foregroundColor: Colors.white,
+          extendedTextStyle: GoogleFonts.prompt(fontSize: 15, fontWeight: FontWeight.w600),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        ),
+      ),
+      home: StreamBuilder<User?>(
+        stream: auth.authStateChanges(),
+        builder: (c, s) {
+          if (s.connectionState == ConnectionState.waiting) return const Loading();
+          return s.data == null ? const LoginPage() : const Gate();
+        },
+      ),
+    );
+  }
+}
+
+class Loading extends StatelessWidget {
+  const Loading({super.key});
+  @override
+  Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
+}
+
+// ---------- login / register ----------
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+  @override
+  State<LoginPage> createState() => _LoginState();
+}
+
+class _LoginState extends State<LoginPage> {
+  final email = TextEditingController(), pass = TextEditingController();
+  final name = TextEditingController(), sid = TextEditingController();
+  bool teacher = false, register = false, busy = false, hide = true;
+
+  Future<void> submit() async {
+    final e = email.text.trim();
+    setState(() => busy = true);
+    try {
+      if (register) {
+        if (teacher && !e.endsWith('@gmail.com')) throw 'อาจารย์ต้องใช้อีเมล @gmail.com';
+        if (!teacher && !e.endsWith('@kmitl.ac.th')) throw 'นักศึกษาต้องใช้อีเมล @kmitl.ac.th';
+        if (pass.text.length < 6) throw 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร';
+        if (name.text.trim().isEmpty) throw 'กรุณากรอกชื่อ-สกุล';
+        if (!teacher && sid.text.trim().isEmpty) throw 'กรุณากรอกรหัสนักศึกษา';
+        registering = true;
+        final cr = await auth.createUserWithEmailAndPassword(email: e, password: pass.text);
+        await db.doc('users/${cr.user!.uid}').set({
+          'email': e,
+          'name': name.text.trim(),
+          'studentId': sid.text.trim(),
+          'role': teacher ? 'teacher' : 'student',
+        });
+      } else {
+        await auth.signInWithEmailAndPassword(email: e, password: pass.text);
+      }
+    } on FirebaseAuthException catch (ex) {
+      final m = {
+        'invalid-credential': 'อีเมลหรือรหัสผ่านไม่ถูกต้อง',
+        'wrong-password': 'รหัสผ่านไม่ถูกต้อง',
+        'user-not-found': 'ไม่พบบัญชีนี้',
+        'email-already-in-use': 'อีเมลนี้ถูกใช้แล้ว',
+        'invalid-email': 'รูปแบบอีเมลไม่ถูกต้อง',
+      };
+      if (mounted) toast(context, m[ex.code] ?? 'เกิดข้อผิดพลาด: ${ex.code}');
+    } catch (ex) {
+      if (mounted) toast(context, ex.toString());
+    } finally {
+      registering = false;
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  Future<void> googleLogin() async {
+    setState(() => busy = true);
+    try {
+      final UserCredential cr;
+      if (kIsWeb) {
+        cr = await auth.signInWithPopup(GoogleAuthProvider()..setCustomParameters({'prompt': 'select_account'}));
+      } else {
+        if (!gsiReady) {
+          await GoogleSignIn.instance.initialize(serverClientId: kWebClientId);
+          gsiReady = true;
+        }
+        final acc = await GoogleSignIn.instance.authenticate();
+        final idToken = acc.authentication.idToken;
+        if (idToken == null) throw 'ไม่ได้รับ ID token จาก Google';
+        cr = await auth.signInWithCredential(GoogleAuthProvider.credential(idToken: idToken));
+      }
+      final e = cr.user?.email ?? '';
+      if (!e.endsWith('@gmail.com') && !e.endsWith('@kmitl.ac.th')) {
+        await auth.signOut();
+        if (!kIsWeb) await GoogleSignIn.instance.signOut();
+        throw 'ใช้ได้เฉพาะอีเมล @gmail.com (ครู) หรือ @kmitl.ac.th (นักศึกษา)';
+      }
+    } on GoogleSignInException catch (ex) {
+      if (mounted && ex.code != GoogleSignInExceptionCode.canceled) {
+        toast(context, 'Google: ${ex.code.name} ${ex.description ?? ''}');
+      }
+    } on FirebaseAuthException catch (ex) {
+      if (mounted) toast(context, 'Firebase: ${ex.code}');
+    } catch (ex) {
+      if (mounted) toast(context, ex.toString());
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  Widget roleButton(String label, IconData icon, bool value) {
+    final on = teacher == value;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => teacher = value),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          decoration: BoxDecoration(
+            color: on ? kBlue : Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: on ? kBlue : kLine, width: 1.5),
+          ),
+          child: Column(children: [
+            Icon(icon, color: on ? Colors.white : kMuted),
+            const SizedBox(height: 4),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 13, fontWeight: FontWeight.w600, color: on ? Colors.white : kMuted)),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: Column(children: [
+          Header(
+            child: Column(children: [
+              Container(
+                width: 68,
+                height: 68,
+                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
+                child: const Icon(Icons.qr_code_2_rounded, size: 42, color: kBlue),
+              ),
+              const SizedBox(height: 14),
+              const Text('ClassCheck QR',
+                  style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 4),
+              const Text('เช็คชื่อด้วย QR ครูเห็นผลทันที ไม่ต้องขานชื่อ',
+                  textAlign: TextAlign.center, style: TextStyle(color: Colors.white70, fontSize: 14)),
+            ]),
+          ),
+          Expanded(
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 460),
+                child: ListView(padding: const EdgeInsets.fromLTRB(24, 24, 24, 24), children: [
+                  Text(register ? 'สร้างบัญชีใหม่' : 'เข้าสู่ระบบ',
+                      style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 16),
+                  if (register) ...[
+                    Row(children: [
+                      roleButton('นักเรียน / นักศึกษา', Icons.school_outlined, false),
+                      const SizedBox(width: 12),
+                      roleButton('ครู / อาจารย์', Icons.badge_outlined, true),
+                    ]),
+                    const SizedBox(height: 14),
+                    TextField(
+                        controller: name,
+                        decoration: const InputDecoration(
+                            labelText: 'ชื่อ-สกุล', prefixIcon: Icon(Icons.person_outline))),
+                    if (!teacher) ...[
+                      const SizedBox(height: 12),
+                      TextField(
+                          controller: sid,
+                          decoration: const InputDecoration(
+                              labelText: 'รหัสนักศึกษา', prefixIcon: Icon(Icons.tag))),
+                    ],
+                    const SizedBox(height: 12),
+                  ],
+                  TextField(
+                    controller: email,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: InputDecoration(
+                      labelText: 'อีเมล',
+                      prefixIcon: const Icon(Icons.mail_outline),
+                      helperText: register ? (teacher ? 'ใช้ @gmail.com' : 'ใช้อีเมลสถาบัน @kmitl.ac.th') : null,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: pass,
+                    obscureText: hide,
+                    decoration: InputDecoration(
+                      labelText: 'รหัสผ่าน',
+                      prefixIcon: const Icon(Icons.lock_outline),
+                      suffixIcon: IconButton(
+                          icon: Icon(hide ? Icons.visibility_off_outlined : Icons.visibility_outlined),
+                          onPressed: () => setState(() => hide = !hide)),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  FilledButton(
+                    onPressed: busy ? null : submit,
+                    child: busy
+                        ? const SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white))
+                        : Text(register ? 'สมัครสมาชิก' : 'เข้าสู่ระบบ'),
+                  ),
+                  const SizedBox(height: 18),
+                  Row(children: const [
+                    Expanded(child: Divider(color: kLine)),
+                    Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 12),
+                        child: Text('หรือ', style: TextStyle(color: kMuted))),
+                    Expanded(child: Divider(color: kLine)),
+                  ]),
+                  const SizedBox(height: 18),
+                  OutlinedButton.icon(
+                    onPressed: busy ? null : googleLogin,
+                    icon: const Icon(Icons.account_circle_outlined, color: kBlue),
+                    label: const Text('เข้าสู่ระบบด้วย Google'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: () => setState(() => register = !register),
+                    child: Text(register ? 'มีบัญชีแล้ว? เข้าสู่ระบบ' : 'ยังไม่มีบัญชี? สมัครสมาชิก'),
+                  ),
+                ]),
+              ),
+            ),
+          ),
+        ]),
+      );
+}
+
+// ---------- gate + profile ----------
+class Gate extends StatelessWidget {
+  const Gate({super.key});
+  @override
+  Widget build(BuildContext context) => StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: db.doc('users/${auth.currentUser!.uid}').snapshots(),
+        builder: (c, s) {
+          if (!s.hasData) return const Loading();
+          if (!s.data!.exists) return registering ? const Loading() : const ProfileSetup();
+          return Home(user: s.data!.data()!);
+        },
+      );
+}
+
+class ProfileSetup extends StatefulWidget {
+  const ProfileSetup({super.key});
+  @override
+  State<ProfileSetup> createState() => _ProfileSetupState();
+}
+
+class _ProfileSetupState extends State<ProfileSetup> {
+  final name = TextEditingController(text: auth.currentUser?.displayName ?? '');
+  final sid = TextEditingController();
+  final email = auth.currentUser?.email ?? '';
+  late final bool teacher = !email.endsWith('@kmitl.ac.th');
+
+  Future<void> save() async {
+    if (name.text.trim().isEmpty) return toast(context, 'กรุณากรอกชื่อ-สกุล');
+    if (!teacher && sid.text.trim().isEmpty) return toast(context, 'กรุณากรอกรหัสนักศึกษา');
+    await db.doc('users/${auth.currentUser!.uid}').set({
+      'email': email,
+      'name': name.text.trim(),
+      'studentId': sid.text.trim(),
+      'role': teacher ? 'teacher' : 'student',
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: Column(children: [
+          Header(
+            child: Row(children: [
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('ตั้งค่าโปรไฟล์',
+                      style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  Text(email, style: const TextStyle(color: Colors.white70)),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                    decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(20)),
+                    child: Text(teacher ? 'ครู / อาจารย์' : 'นักเรียน / นักศึกษา',
+                        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500)),
+                  ),
+                ]),
+              ),
+              IconButton(onPressed: auth.signOut, icon: const Icon(Icons.logout, color: Colors.white)),
+            ]),
+          ),
+          Expanded(
+            child: ListView(padding: const EdgeInsets.all(24), children: [
+              TextField(
+                  controller: name,
+                  decoration:
+                      const InputDecoration(labelText: 'ชื่อ-สกุล', prefixIcon: Icon(Icons.person_outline))),
+              if (!teacher) ...[
+                const SizedBox(height: 12),
+                TextField(
+                    controller: sid,
+                    decoration: const InputDecoration(labelText: 'รหัสนักศึกษา', prefixIcon: Icon(Icons.tag))),
+              ],
+              const SizedBox(height: 22),
+              FilledButton(onPressed: save, child: const Text('บันทึกและเริ่มใช้งาน')),
+            ]),
+          ),
+        ]),
+      );
+}
+
+// ---------- home ----------
+class Home extends StatelessWidget {
+  final Map<String, dynamic> user;
+  const Home({super.key, required this.user});
+  bool get isT => user['role'] == 'teacher';
+
+  Future<void> createClass(BuildContext c) async {
+    final v = await askText(c, 'สร้างชั้นเรียน', ['ชื่อวิชา', 'รหัสวิชา']);
+    if (v == null || v[0].isEmpty) return;
+    await db.collection('classes').add({
+      'name': v[0],
+      'subjectCode': v[1],
+      'code': genCode(),
+      'teacherId': auth.currentUser!.uid,
+      'members': [],
+    });
+  }
+
+  Future<void> joinClass(BuildContext c) async {
+    final v = await askText(c, 'เข้าร่วมชั้นเรียน', ['รหัสห้อง 6 ตัว']);
+    if (v == null || v[0].isEmpty) return;
+    final q = await db.collection('classes').where('code', isEqualTo: v[0].toUpperCase()).limit(1).get();
+    if (q.docs.isEmpty) {
+      if (c.mounted) toast(c, 'ไม่พบรหัสห้องนี้ ตรวจสอบรหัสกับอาจารย์อีกครั้ง');
+      return;
+    }
+    final uid = auth.currentUser!.uid;
+    final ref = q.docs.first.reference;
+    await ref.update({'members': FieldValue.arrayUnion([uid])});
+    await ref.collection('students').doc(uid).set({'name': user['name'], 'studentId': user['studentId']});
+    if (c.mounted) toast(c, 'เข้าร่วมชั้นเรียนแล้ว');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final uid = auth.currentUser!.uid;
+    final q = isT
+        ? db.collection('classes').where('teacherId', isEqualTo: uid)
+        : db.collection('classes').where('members', arrayContains: uid);
+    return Scaffold(
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => isT ? createClass(context) : joinClass(context),
+        icon: Icon(isT ? Icons.add_rounded : Icons.login_rounded),
+        label: Text(isT ? 'สร้างชั้นเรียน' : 'เข้าร่วมชั้นเรียน'),
+      ),
+      body: Column(children: [
+        Header(
+          child: Row(children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('สวัสดี', style: TextStyle(color: Colors.white70, fontSize: 14)),
+                Text('${user['name'] ?? ''}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                  decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(20)),
+                  child: Text(isT ? 'ครู / อาจารย์' : 'นักเรียน / นักศึกษา',
+                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500)),
+                ),
+              ]),
+            ),
+            IconButton(
+                tooltip: 'ออกจากระบบ',
+                onPressed: auth.signOut,
+                icon: const Icon(Icons.logout_rounded, color: Colors.white)),
+          ]),
+        ),
+        Expanded(
+          child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: q.snapshots(),
+            builder: (c, s) {
+              if (!s.hasData) return const Loading();
+              final docs = s.data!.docs;
+              if (docs.isEmpty) {
+                return EmptyState(
+                  icon: Icons.class_outlined,
+                  title: 'ยังไม่มีชั้นเรียน',
+                  hint: isT ? 'กด "สร้างชั้นเรียน" แล้วแจกรหัสห้องให้นักศึกษา' : 'กด "เข้าร่วมชั้นเรียน" แล้วใส่รหัสห้องจากอาจารย์',
+                );
+              }
+              return ListView.separated(
+                padding: const EdgeInsets.fromLTRB(16, 18, 16, 96),
+                itemCount: docs.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 12),
+                itemBuilder: (c, i) {
+                  final d = docs[i];
+                  final tile = kTiles[d.id.hashCode.abs() % kTiles.length];
+                  final members = (d['members'] as List).length;
+                  return Material(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(20),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(20),
+                      onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => isT
+                                  ? TeacherClass(id: d.id, data: d.data())
+                                  : StudentClass(id: d.id, data: d.data(), user: user))),
+                      child: Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(20), border: Border.all(color: kLine)),
+                        child: Row(children: [
+                          Container(
+                            width: 52,
+                            height: 52,
+                            decoration: BoxDecoration(
+                                color: tile.withValues(alpha: 0.14), borderRadius: BorderRadius.circular(16)),
+                            child: Icon(Icons.menu_book_rounded, color: tile),
+                          ),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Text('${d['name']}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                              const SizedBox(height: 2),
+                              Text(
+                                  isT
+                                      ? '${d['subjectCode']}  •  $members คน'
+                                      : '${d['subjectCode']}',
+                                  style: const TextStyle(color: kMuted, fontSize: 13)),
+                            ]),
+                          ),
+                          if (isT)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(color: kPaper, borderRadius: BorderRadius.circular(10)),
+                              child: Text('${d['code']}',
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.w700, letterSpacing: 1.5, color: kBlueDeep)),
+                            )
+                          else
+                            const Icon(Icons.chevron_right_rounded, color: kMuted),
+                        ]),
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// ---------- teacher ----------
+class TeacherClass extends StatelessWidget {
+  final String id;
+  final Map<String, dynamic> data;
+  const TeacherClass({super.key, required this.id, required this.data});
+  @override
+  Widget build(BuildContext context) => DefaultTabController(
+        length: 2,
+        child: Scaffold(
+          appBar: AppBar(
+            title: Text(data['name']),
+            bottom: const TabBar(
+              labelColor: kBlueDeep,
+              unselectedLabelColor: kMuted,
+              indicatorColor: kBlue,
+              dividerColor: kLine,
+              tabs: [Tab(text: 'เช็คชื่อ'), Tab(text: 'รายงาน')],
+            ),
+          ),
+          body: TabBarView(children: [CheckTab(classId: id, code: data['code']), ReportTab(classId: id)]),
+        ),
+      );
+}
+
+class CheckTab extends StatelessWidget {
+  final String classId, code;
+  const CheckTab({super.key, required this.classId, required this.code});
+
+  Future<void> openSession(BuildContext c) async {
+    try {
+      final p = await getPos();
+      await db.collection('classes/$classId/sessions').add({
+        'open': true,
+        'startedAt': FieldValue.serverTimestamp(),
+        'lat': p.latitude,
+        'lng': p.longitude,
+        'radius': kRadiusMeters,
+        'lateMin': kLateMinutes,
+      });
+    } catch (e) {
+      if (c.mounted) toast(c, e.toString());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: db.collection('classes/$classId/sessions').where('open', isEqualTo: true).snapshots(),
+        builder: (c, s) {
+          if (!s.hasData) return const Loading();
+          if (s.data!.docs.isEmpty) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(28),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  const Text('รหัสเข้าร่วมห้อง', style: TextStyle(color: kMuted)),
+                  const SizedBox(height: 8),
+                  GestureDetector(
+                    onTap: () {
+                      Clipboard.setData(ClipboardData(text: code));
+                      toast(context, 'คัดลอกรหัสห้องแล้ว');
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+                      decoration: BoxDecoration(
+                          color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: kLine)),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Text(code,
+                            style: const TextStyle(
+                                fontSize: 32, fontWeight: FontWeight.w700, letterSpacing: 4, color: kBlueDeep)),
+                        const SizedBox(width: 10),
+                        const Icon(Icons.copy_rounded, size: 18, color: kMuted),
+                      ]),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('แตะเพื่อคัดลอก แล้วส่งให้นักศึกษา', style: TextStyle(color: kMuted, fontSize: 13)),
+                  const SizedBox(height: 36),
+                  FilledButton.icon(
+                    onPressed: () => openSession(context),
+                    icon: const Icon(Icons.qr_code_2_rounded),
+                    label: const Text('เปิดเช็คชื่อ'),
+                  ),
+                ]),
+              ),
+            );
+          }
+          final sess = s.data!.docs.first;
+          // หน้าจอ QR: เต็มจอสีน้ำเงิน ตั๋ว QR สีขาวอยู่กลาง
+          return Container(
+            width: double.infinity,
+            margin: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                  begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [kBlue, kBlueDeep]),
+              borderRadius: BorderRadius.circular(28),
+            ),
+            child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              const Text('ให้นักศึกษาสแกน QR นี้',
+                  style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              const Text('ต้องอยู่ในรัศมีที่กำหนดจึงจะสแกนผ่าน', style: TextStyle(color: Colors.white70, fontSize: 13)),
+              const SizedBox(height: 20),
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(28),
+                  boxShadow: [
+                    BoxShadow(color: kInk.withValues(alpha: 0.25), blurRadius: 30, offset: const Offset(0, 12))
+                  ],
+                ),
+                child: QrImageView(
+                  data: 'cc|$classId|${sess.id}',
+                  size: 240,
+                  backgroundColor: Colors.white,
+                  eyeStyle: const QrEyeStyle(eyeShape: QrEyeShape.square, color: kInk),
+                  dataModuleStyle: const QrDataModuleStyle(dataModuleShape: QrDataModuleShape.square, color: kInk),
+                ),
+              ),
+              const SizedBox(height: 24),
+              StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                stream: sess.reference.collection('records').snapshots(),
+                builder: (c, r) => Column(children: [
+                  Text('${r.data?.docs.length ?? 0}',
+                      style: const TextStyle(color: Colors.white, fontSize: 48, fontWeight: FontWeight.w700, height: 1)),
+                  const Text('คนเช็คชื่อแล้ว', style: TextStyle(color: Colors.white70)),
+                ]),
+              ),
+              const SizedBox(height: 24),
+              TextButton.icon(
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  backgroundColor: Colors.white.withValues(alpha: 0.18),
+                  padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                onPressed: () => sess.reference.update({'open': false}),
+                icon: const Icon(Icons.stop_circle_outlined),
+                label: const Text('ปิดการเช็คชื่อ'),
+              ),
+            ]),
+          );
+        },
+      );
+}
+
+class ReportTab extends StatefulWidget {
+  final String classId;
+  const ReportTab({super.key, required this.classId});
+  @override
+  State<ReportTab> createState() => _ReportState();
+}
+
+class _ReportState extends State<ReportTab> {
+  String? sid;
+  @override
+  Widget build(BuildContext context) {
+    final base = 'classes/${widget.classId}';
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: db.collection('$base/sessions').orderBy('startedAt', descending: true).snapshots(),
+      builder: (c, ss) {
+        if (!ss.hasData) return const Loading();
+        final sessions = ss.data!.docs;
+        if (sessions.isEmpty) {
+          return const EmptyState(
+              icon: Icons.insert_chart_outlined_rounded,
+              title: 'ยังไม่มีการเช็คชื่อ',
+              hint: 'เปิดเช็คชื่อในแท็บแรก แล้วผลจะมาแสดงที่นี่');
+        }
+        sid ??= sessions.first.id;
+        final current = sessions.any((e) => e.id == sid) ? sid : sessions.first.id;
+        return Column(children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: BoxDecoration(
+                  color: Colors.white, borderRadius: BorderRadius.circular(14), border: Border.all(color: kLine)),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: current,
+                  isExpanded: true,
+                  borderRadius: BorderRadius.circular(14),
+                  icon: const Icon(Icons.expand_more_rounded),
+                  items: [
+                    for (final s in sessions)
+                      DropdownMenuItem(
+                          value: s.id, child: Text('คาบ ${fmt((s['startedAt'] as Timestamp?)?.toDate())}')),
+                  ],
+                  onChanged: (v) => setState(() => sid = v),
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: db.collection('$base/students').snapshots(),
+              builder: (c, st) => StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                stream: db.collection('$base/sessions/$current/records').snapshots(),
+                builder: (c, rs) {
+                  if (!st.hasData || !rs.hasData) return const Loading();
+                  final rec = {for (final d in rs.data!.docs) d.id: d.data()};
+                  final students = st.data!.docs.toList()
+                    ..sort((a, b) => '${a['studentId']}'.compareTo('${b['studentId']}'));
+                  final rows = <List<String>>[];
+                  var ok = 0, late = 0, absent = 0;
+                  for (var i = 0; i < students.length; i++) {
+                    final s = students[i];
+                    final r = rec[s.id];
+                    final status = r?['status'] ?? 'ขาด';
+                    if (status == 'ตรงเวลา') ok++;
+                    if (status == 'สาย') late++;
+                    if (status == 'ขาด') absent++;
+                    rows.add([
+                      '${i + 1}',
+                      '${s['studentId']}',
+                      '${s['name']}',
+                      status,
+                      fmtTime((r?['time'] as Timestamp?)?.toDate()),
+                    ]);
+                  }
+                  return ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 24), children: [
+                    StatusBar(ok: ok, late: late, absent: absent),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton.icon(
+                        icon: const Icon(Icons.copy_rounded, size: 18),
+                        label: const Text('คัดลอกเป็น CSV (วางใน Excel)'),
+                        onPressed: () {
+                          final csv =
+                              '\uFEFFลำดับ,รหัส,ชื่อ-สกุล,สถานะ,เวลา\n${rows.map((r) => r.join(',')).join('\n')}';
+                          Clipboard.setData(ClipboardData(text: csv));
+                          toast(context, 'คัดลอกแล้ว นำไปวางใน Excel ได้เลย');
+                        },
+                      ),
+                    ),
+                    if (rows.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 24),
+                        child: Center(child: Text('ยังไม่มีนักศึกษาเข้าร่วมห้องนี้', style: TextStyle(color: kMuted))),
+                      ),
+                    for (final r in rows)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: kLine)),
+                        child: Row(children: [
+                          Container(
+                            width: 4,
+                            height: 36,
+                            decoration: BoxDecoration(
+                                color: statusColor(r[3]), borderRadius: BorderRadius.circular(4)),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Text(r[2], style: const TextStyle(fontWeight: FontWeight.w600)),
+                              Text('${r[1]}   ${r[4]}', style: const TextStyle(color: kMuted, fontSize: 12.5)),
+                            ]),
+                          ),
+                          StatusChip(r[3]),
+                        ]),
+                      ),
+                  ]);
+                },
+              ),
+            ),
+          ),
+        ]);
+      },
+    );
+  }
+}
+
+// ---------- student ----------
+class StudentClass extends StatelessWidget {
+  final String id;
+  final Map<String, dynamic> data, user;
+  const StudentClass({super.key, required this.id, required this.data, required this.user});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text(data['name'])),
+        floatingActionButton: FloatingActionButton.extended(
+          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ScanPage(user: user))),
+          icon: const Icon(Icons.qr_code_scanner_rounded),
+          label: const Text('สแกนเช็คชื่อ'),
+        ),
+        body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: db.collection('classes/$id/sessions').orderBy('startedAt', descending: true).snapshots(),
+          builder: (c, s) {
+            if (!s.hasData) return const Loading();
+            if (s.data!.docs.isEmpty) {
+              return const EmptyState(
+                  icon: Icons.event_available_outlined,
+                  title: 'ยังไม่มีการเช็คชื่อ',
+                  hint: 'เมื่อครูเปิดเช็คชื่อ กด "สแกนเช็คชื่อ" แล้วสแกน QR บนจอ');
+            }
+            return ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 96), children: [
+              const Padding(
+                padding: EdgeInsets.only(left: 4, bottom: 10),
+                child: Text('ประวัติการเข้าเรียน', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+              ),
+              for (final d in s.data!.docs)
+                FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                  future: d.reference.collection('records').doc(auth.currentUser!.uid).get(),
+                  builder: (c, r) {
+                    final status = r.hasData
+                        ? (r.data!.exists ? r.data!['status'] : (d['open'] == true ? 'ยังไม่เช็ค' : 'ขาด'))
+                        : '...';
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                      decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: kLine)),
+                      child: Row(children: [
+                        const Icon(Icons.event_note_outlined, color: kMuted),
+                        const SizedBox(width: 12),
+                        Expanded(child: Text(fmt((d['startedAt'] as Timestamp?)?.toDate()))),
+                        StatusChip(status),
+                      ]),
+                    );
+                  },
+                ),
+            ]);
+          },
+        ),
+      );
+}
+
+class ScanPage extends StatefulWidget {
+  final Map<String, dynamic> user;
+  const ScanPage({super.key, required this.user});
+  @override
+  State<ScanPage> createState() => _ScanState();
+}
+
+class _ScanState extends State<ScanPage> {
+  bool busy = false;
+
+  Future<void> onCode(String raw) async {
+    if (busy) return;
+    busy = true;
+    try {
+      final parts = raw.split('|');
+      if (parts.length != 3 || parts[0] != 'cc') throw 'QR ไม่ถูกต้อง';
+      final cid = parts[1], sid = parts[2], uid = auth.currentUser!.uid;
+      final s = await db.doc('classes/$cid/sessions/$sid').get();
+      if (!s.exists || s['open'] != true) throw 'การเช็คชื่อนี้ปิดแล้ว';
+      final stu = await db.doc('classes/$cid/students/$uid').get();
+      if (!stu.exists) throw 'คุณไม่ได้อยู่ในชั้นเรียนนี้';
+      final p = await getPos();
+      final dist = Geolocator.distanceBetween(p.latitude, p.longitude, s['lat'], s['lng']);
+      if (dist > (s['radius'] as num)) throw 'อยู่นอกรัศมี (ห่าง ${dist.round()} เมตร)';
+      final started = (s['startedAt'] as Timestamp?)?.toDate() ?? DateTime.now();
+      final isLate = DateTime.now().difference(started).inMinutes > (s['lateMin'] as num);
+      await db.doc('classes/$cid/sessions/$sid/records/$uid').set({
+        'name': widget.user['name'],
+        'studentId': widget.user['studentId'],
+        'status': isLate ? 'สาย' : 'ตรงเวลา',
+        'time': FieldValue.serverTimestamp(),
+        'distance': dist.round(),
+      });
+      if (mounted) {
+        toast(context, 'เช็คชื่อสำเร็จ (${isLate ? 'สาย' : 'ตรงเวลา'})');
+        Navigator.pop(context);
+      }
+    } catch (e) {
+      if (mounted) toast(context, e.toString());
+      await Future.delayed(const Duration(seconds: 2));
+      busy = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        extendBodyBehindAppBar: true,
+        appBar: AppBar(
+          backgroundColor: Colors.transparent,
+          foregroundColor: Colors.white,
+          title: const Text('สแกน QR เพื่อเช็คชื่อ', style: TextStyle(color: Colors.white)),
+        ),
+        body: Stack(fit: StackFit.expand, children: [
+          MobileScanner(onDetect: (cap) {
+            final v = cap.barcodes.isNotEmpty ? cap.barcodes.first.rawValue : null;
+            if (v != null) onCode(v);
+          }),
+          IgnorePointer(
+            child: Center(
+              child: Container(
+                width: 260,
+                height: 260,
+                decoration: BoxDecoration(
+                    border: Border.all(color: Colors.white, width: 3), borderRadius: BorderRadius.circular(32)),
+              ),
+            ),
+          ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 64,
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                decoration:
+                    BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(24)),
+                child: const Text('จ่อกล้องไปที่ QR บนจอของอาจารย์', style: TextStyle(color: Colors.white)),
+              ),
+            ),
+          ),
+        ]),
+      );
+}
