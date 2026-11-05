@@ -1,0 +1,45 @@
+name: CI
+
+# รันอัตโนมัติทุกครั้งที่ push หรือเปิด Pull Request เข้า main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ดึงโค้ด
+        uses: actions/checkout@v4
+
+      - name: ติดตั้ง Java (ใช้ build Android)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: ติดตั้ง Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: ติดตั้งแพ็กเกจ
+        run: flutter pub get
+
+      - name: ตรวจโค้ด (analyze)
+        run: flutter analyze --no-fatal-infos
+
+      - name: รันเทสต์ + วัด coverage
+        run: flutter test --coverage
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: เก็บไฟล์ APK ไว้ให้ดาวน์โหลด
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
